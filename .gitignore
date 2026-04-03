@@ -45,3 +45,4 @@ output/
 .build
 claude.md
 .claude/
+models/

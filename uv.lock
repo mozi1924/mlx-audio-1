@@ -1204,6 +1204,7 @@ tts = [
     { name = "phonemizer-fork" },
     { name = "sentencepiece" },
     { name = "spacy" },
+    { name = "tiktoken" },
 ]
 
 [package.metadata]
@@ -1253,6 +1254,7 @@ requires-dist = [
     { name = "tiktoken", marker = "extra == 'all'", specifier = ">=0.9.0" },
     { name = "tiktoken", marker = "extra == 'sts'", specifier = ">=0.9.0" },
     { name = "tiktoken", marker = "extra == 'stt'", specifier = ">=0.9.0" },
+    { name = "tiktoken", marker = "extra == 'tts'", specifier = ">=0.9.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformers", specifier = ">=5.0.0" },
     { name = "uvicorn", marker = "extra == 'all'", specifier = ">=0.22.0" },

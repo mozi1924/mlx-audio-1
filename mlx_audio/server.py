@@ -8,6 +8,7 @@ It offers an OpenAI-compatible API for Audio completions and model management.
 import argparse
 import asyncio
 import base64
+import gc
 import inspect
 import io
 import json
@@ -70,6 +71,8 @@ def sanitize_for_json(obj: Any) -> Any:
 
 
 MLX_AUDIO_NUM_WORKERS = os.getenv("MLX_AUDIO_NUM_WORKERS", "2")
+MODEL_IDLE_TIMEOUT_SECONDS = 15 * 60
+MODEL_CLEANUP_INTERVAL_SECONDS = 60
 
 
 class ModelProvider:
@@ -77,22 +80,195 @@ class ModelProvider:
         self.models: Dict[str, Dict[str, Any]] = {}
         self.lock = asyncio.Lock()
 
-    def load_model(self, model_name: str):
-        if model_name not in self.models:
-            self.models[model_name] = load_model(model_name)
+    @staticmethod
+    def _release_memory():
+        gc.collect()
+        mx.clear_cache()
 
-        return self.models[model_name]
-
-    async def remove_model(self, model_name: str) -> bool:
+    async def acquire_model(self, model_name: str):
         async with self.lock:
-            if model_name in self.models:
-                del self.models[model_name]
-                return True
-            return False
+            entry = self.models.get(model_name)
+            if entry is None:
+                entry = {
+                    "model": load_model(model_name),
+                    "last_used_at": time.monotonic(),
+                    "active_requests": 0,
+                }
+                self.models[model_name] = entry
+
+            entry["active_requests"] += 1
+            return entry["model"]
+
+    async def mark_model_used(self, model_name: str) -> None:
+        async with self.lock:
+            entry = self.models.get(model_name)
+            if entry is not None:
+                entry["last_used_at"] = time.monotonic()
+
+    async def release_model(self, model_name: str, success: bool = False) -> None:
+        async with self.lock:
+            entry = self.models.get(model_name)
+            if entry is None:
+                return
+
+            entry["active_requests"] = max(0, entry["active_requests"] - 1)
+            if success:
+                entry["last_used_at"] = time.monotonic()
+
+    async def remove_model(self, model_name: str, force: bool = False) -> str:
+        model_to_release = None
+        async with self.lock:
+            entry = self.models.get(model_name)
+            if entry is None:
+                return "not_found"
+            if entry["active_requests"] > 0 and not force:
+                return "busy"
+
+            model_to_release = entry["model"]
+            del self.models[model_name]
+
+        del model_to_release
+        self._release_memory()
+        return "removed"
+
+    async def unload_idle_models(self, idle_timeout_seconds: float) -> List[str]:
+        now = time.monotonic()
+        models_to_unload = []
+
+        async with self.lock:
+            for model_name, entry in list(self.models.items()):
+                if entry["active_requests"] > 0:
+                    continue
+                if now - entry["last_used_at"] >= idle_timeout_seconds:
+                    models_to_unload.append((model_name, entry["model"]))
+                    del self.models[model_name]
+
+        for model_name, model in models_to_unload:
+            del model
+
+        if models_to_unload:
+            self._release_memory()
+
+        return [model_name for model_name, _ in models_to_unload]
+
+    async def unload_all_models(self) -> None:
+        models_to_release = []
+        async with self.lock:
+            for entry in self.models.values():
+                models_to_release.append(entry["model"])
+            self.models.clear()
+
+        for model in models_to_release:
+            del model
+
+        if models_to_release:
+            self._release_memory()
 
     async def get_available_models(self):
         async with self.lock:
             return list(self.models.keys())
+
+
+class SAMModelProvider:
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.model = None
+        self.processor = None
+        self.model_name = None
+        self.last_used_at = 0.0
+        self.active_requests = 0
+
+    @staticmethod
+    def _release_memory():
+        gc.collect()
+        mx.clear_cache()
+
+    async def acquire(self, model_name: str):
+        from mlx_audio.sts import SAMAudio, SAMAudioProcessor
+
+        async with self.lock:
+            if self.model_name not in (None, model_name):
+                if self.active_requests > 0:
+                    raise RuntimeError(
+                        f"SAM model '{self.model_name}' is busy and cannot switch to '{model_name}'"
+                    )
+                old_model = self.model
+                old_processor = self.processor
+                self.model = None
+                self.processor = None
+                self.model_name = None
+                if old_model is not None:
+                    del old_model
+                if old_processor is not None:
+                    del old_processor
+                self._release_memory()
+
+            if self.processor is None:
+                self.processor = SAMAudioProcessor.from_pretrained(model_name)
+            if self.model is None:
+                self.model = SAMAudio.from_pretrained(model_name)
+            self.model_name = model_name
+            self.active_requests += 1
+            if self.last_used_at == 0.0:
+                self.last_used_at = time.monotonic()
+
+            return self.model, self.processor
+
+    async def release(self, success: bool = False) -> None:
+        async with self.lock:
+            self.active_requests = max(0, self.active_requests - 1)
+            if success and self.model is not None:
+                self.last_used_at = time.monotonic()
+
+    async def unload_if_idle(self, idle_timeout_seconds: float) -> bool:
+        model_to_release = None
+        processor_to_release = None
+
+        async with self.lock:
+            if self.model is None:
+                return False
+            if self.active_requests > 0:
+                return False
+            if time.monotonic() - self.last_used_at < idle_timeout_seconds:
+                return False
+
+            model_to_release = self.model
+            processor_to_release = self.processor
+            self.model = None
+            self.processor = None
+            self.model_name = None
+            self.last_used_at = 0.0
+
+        if model_to_release is not None:
+            del model_to_release
+        if processor_to_release is not None:
+            del processor_to_release
+        self._release_memory()
+        return True
+
+    async def unload(self, force: bool = False) -> bool:
+        model_to_release = None
+        processor_to_release = None
+
+        async with self.lock:
+            if self.model is None:
+                return False
+            if self.active_requests > 0 and not force:
+                return False
+
+            model_to_release = self.model
+            processor_to_release = self.processor
+            self.model = None
+            self.processor = None
+            self.model_name = None
+            self.last_used_at = 0.0
+
+        if model_to_release is not None:
+            del model_to_release
+        if processor_to_release is not None:
+            del processor_to_release
+        self._release_memory()
+        return True
 
 
 app = FastAPI()
@@ -195,6 +371,47 @@ class SeparationResponse(BaseModel):
 
 # Initialize the ModelProvider
 model_provider = ModelProvider()
+sam_model_provider = SAMModelProvider()
+
+
+async def idle_model_cleanup_loop():
+    try:
+        while True:
+            await asyncio.sleep(MODEL_CLEANUP_INTERVAL_SECONDS)
+            unloaded_models = await model_provider.unload_idle_models(
+                MODEL_IDLE_TIMEOUT_SECONDS
+            )
+            if unloaded_models:
+                print(
+                    "Unloaded idle models: " + ", ".join(sorted(unloaded_models))
+                )
+
+            sam_unloaded = await sam_model_provider.unload_if_idle(
+                MODEL_IDLE_TIMEOUT_SECONDS
+            )
+            if sam_unloaded:
+                print("Unloaded idle SAM model")
+    except asyncio.CancelledError:
+        raise
+
+
+@app.on_event("startup")
+async def start_idle_cleanup_task():
+    app.state.idle_cleanup_task = asyncio.create_task(idle_model_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def stop_idle_cleanup_task():
+    cleanup_task = getattr(app.state, "idle_cleanup_task", None)
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+
+    await model_provider.unload_all_models()
+    await sam_model_provider.unload(force=True)
 
 
 @app.get("/")
@@ -234,7 +451,12 @@ async def add_model(model_name: str):
     Returns:
         dict (dict): A dictionary containing the status of the operation.
     """
-    model_provider.load_model(model_name)
+    model = await model_provider.acquire_model(model_name)
+    try:
+        await model_provider.mark_model_used(model_name)
+    finally:
+        await model_provider.release_model(model_name, success=model is not None)
+
     return {"status": "success", "message": f"Model {model_name} added successfully"}
 
 
@@ -253,82 +475,99 @@ async def remove_model(model_name: str):
         HTTPException (str): If the model is not found.
     """
     model_name = unquote(model_name).strip('"')
-    removed = await model_provider.remove_model(model_name)
-    if removed:
+    removal_status = await model_provider.remove_model(model_name)
+    if removal_status == "removed":
         return Response(status_code=204)  # 204 No Content - successful deletion
-    else:
-        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
-
-
-async def generate_audio(model, payload: SpeechRequest):
-    # Load reference audio if provided
-    ref_audio = payload.ref_audio
-    audio_chunks = []
-    sample_rate = None
-    if ref_audio and isinstance(ref_audio, str):
-        if not os.path.exists(ref_audio):
-            raise HTTPException(
-                status_code=400, detail=f"Reference audio file not found: {ref_audio}"
-            )
-        # Import load_audio from generate module
-        from mlx_audio.tts.generate import load_audio
-
-        # Determine if volume normalization is needed
-        normalize = hasattr(model, "model_type") and model.model_type == "spark"
-
-        ref_audio = load_audio(
-            ref_audio, sample_rate=model.sample_rate, volume_normalize=normalize
+    if removal_status == "busy":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Model '{model_name}' is currently processing a request",
         )
+    raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
-    for result in model.generate(
-        payload.input,
-        voice=payload.voice,
-        speed=payload.speed,
-        gender=payload.gender,
-        pitch=payload.pitch,
-        instruct=payload.instruct,
-        lang_code=payload.lang_code,
-        ref_audio=ref_audio,
-        ref_text=payload.ref_text,
-        temperature=payload.temperature,
-        top_p=payload.top_p,
-        top_k=payload.top_k,
-        repetition_penalty=payload.repetition_penalty,
-        stream=payload.stream,
-        streaming_interval=payload.streaming_interval,
-        max_tokens=payload.max_tokens,
-        verbose=payload.verbose,
-    ):
+
+async def generate_audio(model_name: str, model, payload: SpeechRequest):
+    success = False
+    try:
+        # Load reference audio if provided
+        ref_audio = payload.ref_audio
+        audio_chunks = []
+        sample_rate = None
+        if ref_audio and isinstance(ref_audio, str):
+            if not os.path.exists(ref_audio):
+                raise HTTPException(
+                    status_code=400, detail=f"Reference audio file not found: {ref_audio}"
+                )
+            # Import load_audio from generate module
+            from mlx_audio.tts.generate import load_audio
+
+            # Determine if volume normalization is needed
+            normalize = hasattr(model, "model_type") and model.model_type == "spark"
+
+            ref_audio = load_audio(
+                ref_audio, sample_rate=model.sample_rate, volume_normalize=normalize
+            )
+
+        for result in model.generate(
+            payload.input,
+            voice=payload.voice,
+            speed=payload.speed,
+            gender=payload.gender,
+            pitch=payload.pitch,
+            instruct=payload.instruct,
+            lang_code=payload.lang_code,
+            ref_audio=ref_audio,
+            ref_text=payload.ref_text,
+            temperature=payload.temperature,
+            top_p=payload.top_p,
+            top_k=payload.top_k,
+            repetition_penalty=payload.repetition_penalty,
+            stream=payload.stream,
+            streaming_interval=payload.streaming_interval,
+            max_tokens=payload.max_tokens,
+            verbose=payload.verbose,
+        ):
+            if payload.stream:
+                buffer = io.BytesIO()
+                audio_write(
+                    buffer,
+                    result.audio,
+                    result.sample_rate,
+                    format=payload.response_format,
+                )
+                success = True
+                yield buffer.getvalue()
+            else:
+                audio_chunks.append(result.audio)
+                if sample_rate is None:
+                    sample_rate = result.sample_rate
 
         if payload.stream:
-            buffer = io.BytesIO()
-            audio_write(
-                buffer, result.audio, result.sample_rate, format=payload.response_format
-            )
-            yield buffer.getvalue()
-        else:
-            audio_chunks.append(result.audio)
-            if sample_rate is None:
-                sample_rate = result.sample_rate
+            return
 
-    if payload.stream:
-        return
+        if not audio_chunks:
+            raise HTTPException(status_code=400, detail="No audio generated")
 
-    if not audio_chunks:
-        raise HTTPException(status_code=400, detail="No audio generated")
-
-    concatenated_audio = np.concatenate(audio_chunks)
-    buffer = io.BytesIO()
-    audio_write(buffer, concatenated_audio, sample_rate, format=payload.response_format)
-    yield buffer.getvalue()
+        concatenated_audio = np.concatenate(audio_chunks)
+        buffer = io.BytesIO()
+        audio_write(
+            buffer,
+            concatenated_audio,
+            sample_rate,
+            format=payload.response_format,
+        )
+        success = True
+        yield buffer.getvalue()
+    finally:
+        await model_provider.release_model(model_name, success=success)
 
 
 @app.post("/v1/audio/speech")
 async def tts_speech(payload: SpeechRequest):
     """Generate speech audio following the OpenAI text-to-speech API."""
-    model = model_provider.load_model(payload.model)
+    model = await model_provider.acquire_model(payload.model)
     return StreamingResponse(
-        generate_audio(model, payload),
+        generate_audio(payload.model, model, payload),
         media_type=f"audio/{payload.response_format}",
         headers={
             "Content-Disposition": f"attachment; filename=speech.{payload.response_format}"
@@ -336,8 +575,11 @@ async def tts_speech(payload: SpeechRequest):
     )
 
 
-def generate_transcription_stream(stt_model, tmp_path: str, gen_kwargs: dict):
-    """Generator that yields transcription chunks and cleans up temp file."""
+async def generate_transcription_stream(
+    model_name: str, stt_model, tmp_path: str, gen_kwargs: dict
+):
+    """Generator that yields transcription chunks, tracks usage, and cleans up temp file."""
+    success = False
     try:
         # Call generate with stream=True (models handle streaming internally)
         result = stt_model.generate(tmp_path, **gen_kwargs)
@@ -359,13 +601,16 @@ def generate_transcription_stream(stt_model, tmp_path: str, gen_kwargs: dict):
                         "is_final": getattr(chunk, "is_final", None),
                         "language": getattr(chunk, "language", None),
                     }
+                success = True
                 yield json.dumps(sanitize_for_json(chunk_data)) + "\n"
         else:
             # Not a generator, yield the full result
+            success = True
             yield json.dumps(sanitize_for_json(result)) + "\n"
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+        await model_provider.release_model(model_name, success=success)
 
 
 @app.post("/v1/audio/transcriptions")
@@ -405,7 +650,7 @@ async def stt_transcriptions(
     tmp_path = f"/tmp/{time.time()}.{ext if ext else 'mp3'}"
     audio_write(tmp_path, audio, sr)
 
-    stt_model = model_provider.load_model(payload.model)
+    stt_model = await model_provider.acquire_model(payload.model)
 
     # Build kwargs for generate, filtering None values
     gen_kwargs = payload.model_dump(exclude={"model"}, exclude_none=True)
@@ -415,13 +660,9 @@ async def stt_transcriptions(
     gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in signature.parameters}
 
     return StreamingResponse(
-        generate_transcription_stream(stt_model, tmp_path, gen_kwargs),
+        generate_transcription_stream(payload.model, stt_model, tmp_path, gen_kwargs),
         media_type="application/x-ndjson",
     )
-
-
-SAM_MODEL = None
-SAM_PROCESSOR = None
 
 
 @app.post("/v1/audio/separations")
@@ -444,28 +685,25 @@ async def audio_separations(
     Returns:
         JSON with base64-encoded target and residual audio, plus sample rate
     """
-    global SAM_MODEL, SAM_PROCESSOR
-    from mlx_audio.sts import SAMAudio, SAMAudioProcessor
-
     # Read uploaded file
     data = await file.read()
     tmp = io.BytesIO(data)
-    audio, sr = sf.read(tmp, always_2d=False)
+    audio, sr = audio_read(tmp, always_2d=False)
     tmp.close()
 
     # Save to temp file for processor
     tmp_path = f"/tmp/separation_{time.time()}.wav"
-    sf.write(tmp_path, audio, sr)
+    audio_write(tmp_path, audio, sr)
 
+    success = False
     try:
-        # Load model and processor
-        if SAM_PROCESSOR is None:
-            SAM_PROCESSOR = SAMAudioProcessor.from_pretrained(model)
-        if SAM_MODEL is None:
-            SAM_MODEL = SAMAudio.from_pretrained(model)
+        try:
+            sam_model, sam_processor = await sam_model_provider.acquire(model)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         # Process inputs
-        batch = SAM_PROCESSOR(
+        batch = sam_processor(
             descriptions=[description],
             audios=[tmp_path],
         )
@@ -475,7 +713,7 @@ async def audio_separations(
         ode_opt = {"method": method, "step_size": step_size}
 
         # Separate audio
-        result = SAM_MODEL.separate_long(
+        result = sam_model.separate_long(
             audios=batch.audios,
             descriptions=batch.descriptions,
             anchor_ids=batch.anchor_ids,
@@ -489,15 +727,16 @@ async def audio_separations(
         # Convert results to numpy
         target_audio = np.array(result.target[0])
         residual_audio = np.array(result.residual[0])
-        sample_rate = SAM_MODEL.sample_rate
+        sample_rate = sam_model.sample_rate
 
         # Encode as base64 WAV
         def audio_to_base64(audio_array, sr):
             buffer = io.BytesIO()
-            sf.write(buffer, audio_array, sr, format="wav")
+            audio_write(buffer, audio_array, sr, format="wav")
             buffer.seek(0)
             return base64.b64encode(buffer.read()).decode("utf-8")
 
+        success = True
         return SeparationResponse(
             target=audio_to_base64(target_audio, sample_rate),
             residual=audio_to_base64(residual_audio, sample_rate),
@@ -505,6 +744,7 @@ async def audio_separations(
         )
 
     finally:
+        await sam_model_provider.release(success=success)
         # Clean up temp file
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -512,6 +752,7 @@ async def audio_separations(
 
 async def _stream_transcription(
     websocket: WebSocket,
+    model_name: str,
     stt_model,
     audio_array: np.ndarray,
     sample_rate: int,
@@ -547,6 +788,7 @@ async def _stream_transcription(
             if chunk_lang and detected_language is None:
                 detected_language = chunk_lang
             await websocket.send_json({"type": "delta", "delta": delta})
+            await model_provider.mark_model_used(model_name)
 
         await websocket.send_json(
             {
@@ -557,6 +799,7 @@ async def _stream_transcription(
                 "is_partial": is_partial,
             }
         )
+        await model_provider.mark_model_used(model_name)
     else:
         tmp_path = f"/tmp/realtime_{time.time()}.mp3"
         audio_write(tmp_path, audio_array, sample_rate)
@@ -575,6 +818,7 @@ async def _stream_transcription(
                     "is_partial": is_partial,
                 }
             )
+            await model_provider.mark_model_used(model_name)
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -585,6 +829,7 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
     """Realtime transcription via WebSocket."""
     await websocket.accept()
 
+    model_name = None
     try:
         # Receive initial configuration
         config = await websocket.receive_json()
@@ -601,7 +846,7 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
 
         # Load the STT model
         print("Loading STT model...")
-        stt_model = model_provider.load_model(model_name)
+        stt_model = await model_provider.acquire_model(model_name)
         print("STT model loaded successfully")
 
         # Initialize WebRTC VAD for speech detection
@@ -741,6 +986,7 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
                     try:
                         await _stream_transcription(
                             websocket,
+                            model_name,
                             stt_model,
                             audio_array,
                             sample_rate,
@@ -767,6 +1013,7 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
                     try:
                         await _stream_transcription(
                             websocket,
+                            model_name,
                             stt_model,
                             audio_array,
                             sample_rate,
@@ -811,6 +1058,8 @@ async def stt_realtime_transcriptions(websocket: WebSocket):
         except Exception:
             pass
     finally:
+        if model_name is not None:
+            await model_provider.release_model(model_name, success=False)
         try:
             await websocket.close()
         except Exception:
